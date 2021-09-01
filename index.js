@@ -17,7 +17,16 @@ const defaultOptions = {
     reduce: null, // (accumulated, props) => { accumulated.sum += props.sum; }
 
     // properties to use for individual points when running the reducer
-    map: props => props // props => ({sum: props.my_value})
+    map: props => props, // props => ({sum: props.my_value})
+
+    // set to true if using an alternate coordinate reference system, ie x/y
+    // if you want to use an alternate CRS you also need to override the
+    // following functions:
+    // - lngX: takes a single value from your CRS and scales to [0,1]
+    // - latY: takes a single value from your CRS and scales to [0,1]
+    // - xLng: takes a single value from [0,1] and scales back to your CRS
+    // - yLat: takes a single value from [0,1] and scales back to your CRS
+    alternateCRS: false
 };
 
 const fround = Math.fround || (tmp => ((x) => { tmp[0] = +x; return tmp[0]; }))(new Float32Array(1));
@@ -42,7 +51,7 @@ export default class Supercluster {
         let clusters = [];
         for (let i = 0; i < points.length; i++) {
             if (!points[i].geometry) continue;
-            clusters.push(createPointCluster(points[i], i));
+            clusters.push(this.createPointCluster(points[i], i));
         }
         this.trees[maxZoom + 1] = new KDBush(clusters, getX, getY, nodeSize, Float32Array);
 
@@ -66,26 +75,39 @@ export default class Supercluster {
     }
 
     getClusters(bbox, zoom) {
-        let minLng = ((bbox[0] + 180) % 360 + 360) % 360 - 180;
-        const minLat = Math.max(-90, Math.min(90, bbox[1]));
-        let maxLng = bbox[2] === 180 ? 180 : ((bbox[2] + 180) % 360 + 360) % 360 - 180;
-        const maxLat = Math.max(-90, Math.min(90, bbox[3]));
-
-        if (bbox[2] - bbox[0] >= 360) {
-            minLng = -180;
-            maxLng = 180;
-        } else if (minLng > maxLng) {
-            const easternHem = this.getClusters([minLng, minLat, 180, maxLat], zoom);
-            const westernHem = this.getClusters([-180, minLat, maxLng, maxLat], zoom);
-            return easternHem.concat(westernHem);
-        }
 
         const tree = this.trees[this._limitZoom(zoom)];
-        const ids = tree.range(lngX(minLng), latY(maxLat), lngX(maxLng), latY(minLat));
+
+        let ids;
+        // standard lat/lng crs
+        if (!this.options.alternateCRS) {
+            let minLng = ((bbox[0] + 180) % 360 + 360) % 360 - 180;
+            const minLat = Math.max(-90, Math.min(90, bbox[1]));
+            let maxLng = bbox[2] === 180 ? 180 : ((bbox[2] + 180) % 360 + 360) % 360 - 180;
+            const maxLat = Math.max(-90, Math.min(90, bbox[3]));
+
+            if (bbox[2] - bbox[0] >= 360) {
+                minLng = -180;
+                maxLng = 180;
+            } else if (minLng > maxLng) {
+                const easternHem = this.getClusters([minLng, minLat, 180, maxLat], zoom);
+                const westernHem = this.getClusters([-180, minLat, maxLng, maxLat], zoom);
+                return easternHem.concat(westernHem);
+            }
+            ids = tree.range(this.lngX(minLng), this.latY(maxLat), this.lngX(maxLng), this.latY(minLat));
+        // custom crs x/y
+        } else {
+            const minLng = bbox[0];
+            const minLat = bbox[1];
+            const maxLng = bbox[2];
+            const maxLat = bbox[3];
+            ids = tree.range(this.lngX(minLng), this.latY(minLat), this.lngX(maxLng), this.latY(maxLat));
+        }
+
         const clusters = [];
         for (const id of ids) {
             const c = tree.points[id];
-            clusters.push(c.numPoints ? getClusterJSON(c) : this.points[c.index]);
+            clusters.push(c.numPoints ? this.getClusterJSON(c) : this.points[c.index]);
         }
         return clusters;
     }
@@ -107,7 +129,7 @@ export default class Supercluster {
         for (const id of ids) {
             const c = index.points[id];
             if (c.parentId === clusterId) {
-                children.push(c.numPoints ? getClusterJSON(c) : this.points[c.index]);
+                children.push(c.numPoints ? this.getClusterJSON(c) : this.points[c.index]);
             }
         }
 
@@ -208,8 +230,8 @@ export default class Supercluster {
             } else {
                 const p = this.points[c.index];
                 tags = p.properties;
-                px = lngX(p.geometry.coordinates[0]);
-                py = latY(p.geometry.coordinates[1]);
+                px = this.lngX(p.geometry.coordinates[0]);
+                py = this.latY(p.geometry.coordinates[1]);
             }
 
             const f = {
@@ -334,6 +356,50 @@ export default class Supercluster {
         const result = this.options.map(original);
         return clone && result === original ? extend({}, result) : result;
     }
+
+
+    // longitude/latitude to spherical mercator in [0..1] range
+    lngX(lng) {
+        return lng / 360 + 0.5;
+    }
+    latY(lat) {
+        const sin = Math.sin(lat * Math.PI / 180);
+        const y = (0.5 - 0.25 * Math.log((1 + sin) / (1 - sin)) / Math.PI);
+        return y < 0 ? 0 : y > 1 ? 1 : y;
+    }
+
+    // spherical mercator to longitude/latitude
+    xLng(x) {
+        return (x - 0.5) * 360;
+    }
+
+    yLat(y) {
+        const y2 = (180 - y * 360) * Math.PI / 180;
+        return 360 * Math.atan(Math.exp(y2)) / Math.PI - 90;
+    }
+
+    createPointCluster(p, id) {
+        const [x, y] = p.geometry.coordinates;
+        return {
+            x: fround(this.lngX(x)), // projected point coordinates
+            y: fround(this.latY(y)),
+            zoom: Infinity, // the last zoom the point was processed at
+            index: id, // index of the source feature in the original input array,
+            parentId: -1 // parent cluster id
+        };
+    }
+
+    getClusterJSON(cluster) {
+        return {
+            type: 'Feature',
+            id: cluster.id,
+            properties: getClusterProperties(cluster),
+            geometry: {
+                type: 'Point',
+                coordinates: [this.xLng(cluster.x), this.yLat(cluster.y)]
+            }
+        };
+    }
 }
 
 function createCluster(x, y, id, numPoints, properties) {
@@ -345,29 +411,6 @@ function createCluster(x, y, id, numPoints, properties) {
         parentId: -1, // parent cluster id
         numPoints,
         properties
-    };
-}
-
-function createPointCluster(p, id) {
-    const [x, y] = p.geometry.coordinates;
-    return {
-        x: fround(lngX(x)), // projected point coordinates
-        y: fround(latY(y)),
-        zoom: Infinity, // the last zoom the point was processed at
-        index: id, // index of the source feature in the original input array,
-        parentId: -1 // parent cluster id
-    };
-}
-
-function getClusterJSON(cluster) {
-    return {
-        type: 'Feature',
-        id: cluster.id,
-        properties: getClusterProperties(cluster),
-        geometry: {
-            type: 'Point',
-            coordinates: [xLng(cluster.x), yLat(cluster.y)]
-        }
     };
 }
 
@@ -384,24 +427,6 @@ function getClusterProperties(cluster) {
     });
 }
 
-// longitude/latitude to spherical mercator in [0..1] range
-function lngX(lng) {
-    return lng / 360 + 0.5;
-}
-function latY(lat) {
-    const sin = Math.sin(lat * Math.PI / 180);
-    const y = (0.5 - 0.25 * Math.log((1 + sin) / (1 - sin)) / Math.PI);
-    return y < 0 ? 0 : y > 1 ? 1 : y;
-}
-
-// spherical mercator to longitude/latitude
-function xLng(x) {
-    return (x - 0.5) * 360;
-}
-function yLat(y) {
-    const y2 = (180 - y * 360) * Math.PI / 180;
-    return 360 * Math.atan(Math.exp(y2)) / Math.PI - 90;
-}
 
 function extend(dest, src) {
     for (const id in src) dest[id] = src[id];
